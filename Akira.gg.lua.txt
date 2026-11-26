@@ -1,0 +1,1302 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Input = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Collection = game:GetService("CollectionService")
+local Storage = game:GetService("ReplicatedStorage")
+local JSON = game:GetService("HttpService")
+local player = Players.LocalPlayer
+if not player then return end
+if not RunService:IsStudio() and player:GetAttribute("AkiraEnabled") ~= true then return end
+
+local playerGui = player:WaitForChild("PlayerGui")
+local previous = playerGui:FindFirstChild("Akira.gg")
+if previous then
+    local stop = previous:FindFirstChild("Stop")
+    if stop and stop:IsA("BindableEvent") then stop:Fire() end
+    previous:Destroy()
+end
+
+local function new(class, parent, properties)
+    local instance = Instance.new(class)
+    for key, value in pairs(properties or {}) do instance[key] = value end
+    instance.Parent = parent
+    return instance
+end
+
+local gui = new("ScreenGui", playerGui, {
+    Name = "Akira.gg", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 20,
+})
+local bridge = new("Folder", gui, {Name = "Bridge"})
+local resolve = new("BindableFunction", bridge, {Name = "ResolveShot"})
+local fire = new("BindableEvent", bridge, {Name = "FireRequested"})
+local strategy = new("BindableEvent", bridge, {Name = "Strategy"})
+local report = new("BindableEvent", bridge, {Name = "Report"})
+local stop = new("BindableEvent", gui, {Name = "Stop"})
+local connections = {}
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+
+local function allowed()
+    return player:GetAttribute("AkiraEnabled") == true
+        or (RunService:IsStudio() and player:GetAttribute("AkiraEnabled") == nil)
+end
+
+local function finite(value)
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+local function cleanName(value)
+    if type(value) ~= "string" then return nil end
+    local name = value:match("^%s*(.-)%s*$")
+    if #name < 1 or #name > 32 or not name:match("^[%w _%.%-]+$") then return nil end
+    return name
+end
+
+local function copy(value)
+    if type(value) ~= "table" then return value end
+    local result = {}
+    for key, child in pairs(value) do result[key] = copy(child) end
+    return result
+end
+
+local fields = {}
+local function field(key, page, label, initial, help, min, max)
+    local entry = {key = key, page = page, label = label, default = initial, help = help, min = min, max = max}
+    table.insert(fields, entry)
+    return entry
+end
+
+field("Mode", "Combat", "Combat mode", "Off", "Off, camera assist, or predictive combat.", {"Off", "Legit", "Rage"})
+field("Activation", "Combat", "Activation", "Hold", "How the combat key enables assistance.", {"Hold", "Toggle", "Always"})
+field("CombatKey", "Combat", "Combat key", "Q", "Keyboard activation. Tap the Aim control on touch.")
+field("Body", "Combat", "Aim point", "Closest", "Choose a fixed body part or the nearest point to center.", {"Closest", "Head", "Torso", "Root"})
+field("Priority", "Combat", "Target priority", "Crosshair", "Rank eligible targets by this metric.", {"Crosshair", "Distance", "Health", "Threat"})
+field("Range", "Combat", "Range", 450, "Maximum distance in studs from the shot origin.", 25, 1500)
+field("Lock", "Combat", "Target stability", 0.75, "Bonus applied to the current target during scoring.", 0, 2)
+field("Visible", "Combat", "Visibility check", true, "Raycast to the predicted aim point before selecting it.")
+field("LegitFov", "Legit", "Legit FOV", 95, "Radius in viewport pixels.", 10, 650)
+field("Smooth", "Legit", "Camera response", 10, "Higher values move the camera faster.", 1, 35)
+field("Silent", "Legit", "Simulated silent aim", false, "Resolve the next normal shot without steering the camera.")
+field("Chance", "Legit", "Assist chance", 100, "Percent of manual shots eligible for silent aim.", 0, 100)
+field("Trigger", "Legit", "Trigger assist", false, "Request a shot when a visible opponent overlaps the reticle.")
+field("TriggerDelay", "Legit", "Trigger dwell", 0.12, "Time on the target before requesting a shot.", 0, 1)
+field("RageFov", "Rage", "Rage FOV", 420, "Acquisition radius. Full view uses every direction.", 25, 1600)
+field("FullView", "Rage", "Full view acquisition", false, "Include opponents outside the viewport.")
+field("AutoFire", "Rage", "Request automatic fire", false, "Requires FireRequested integration in your weapon controller.")
+field("Steer", "Rage", "Steer camera", true, "Aim the camera toward the predicted aim point.")
+field("Lead", "Rage", "Lead multiplier", 1, "Scales modeled movement during projectile travel.", 0, 2)
+field("Latency", "Rage", "Additional lead time", 0.025, "Extra seconds added to predicted movement.", 0, 0.25)
+field("Acceleration", "Rage", "Acceleration prediction", 0.35, "Weight applied to observed acceleration.", 0, 1)
+field("Counter", "Helper", "Counter profile", "Adaptive", "Adaptive switches between profiles using opponent movement.", {"Adaptive", "Default", "UE", "Sleepy", "Custom"})
+field("CustomLead", "Helper", "Custom lead", 0.65, "Prediction scale used by the Custom counter.", 0, 2)
+field("CustomDelay", "Helper", "Custom stability time", 0.12, "Seconds of stable visibility before firing in Custom.", 0, 0.8)
+field("CustomThreshold", "Helper", "Evasion threshold", 55, "Horizontal acceleration threshold in studs/s² for Adaptive.", 15, 150)
+field("Movement", "Helper", "Movement suggestion", "Off", "Send tactical suggestions to the optional movement controller.", {"Off", "Adaptive", "Orbit", "Disengage", "Hold", "Peek"})
+field("OrbitRadius", "Helper", "Orbit or escape distance", 24, "Distance in studs used when suggesting movement.", 8, 85)
+field("OrbitSpeed", "Helper", "Orbit rate", 1.6, "Angular speed in radians per second.", 0.3, 5)
+field("Stats", "Helper", "Combat analytics", true, "Show confirmed accuracy, damage, and target trends.")
+field("Overlay", "Visuals", "Player overlay", true, "Show labels over eligible opponents.")
+field("Boxes", "Visuals", "Character highlight", false, "Draw a depth-tested character highlight.")
+field("Names", "Visuals", "Display name", true, "Show the opponent display name or dummy model name.")
+field("Health", "Visuals", "Health readout", true, "Show observed health.")
+field("Gear", "Visuals", "Weapon label", true, "Read the target's AkiraWeapon attribute.")
+field("Fov", "Visuals", "Acquisition ring", true, "Draw the active viewport radius.")
+field("Crosshair", "Visuals", "Crosshair", "Lines", "Choose the shape at the center of the viewport.", {"Off", "Dot", "Lines"})
+field("Gap", "Visuals", "Crosshair gap", 5, "Distance between the center and each arm.", 0, 25)
+field("Length", "Visuals", "Crosshair length", 9, "Length of each arm in pixels.", 2, 30)
+field("Color", "Visuals", "Overlay color", "#72EAD1", "Color of labels, the ring, and the crosshair.")
+field("CameraFov", "Misc", "Camera field of view", 0, "Enter 0 to retain the game's camera FOV.", 0, 110)
+field("MenuKey", "Misc", "Menu key", "RightShift", "Toggle the desktop control panel.")
+field("AutoSave", "Misc", "Autosave profiles", true, "Save changes after a short pause.")
+
+field("Enabled", "Weapons", "Allow assistance", true, "Disable assistance for this weapon.")
+field("Speed", "Weapons", "Projectile speed", 0, "Studs per second. Set to 0 for hitscan.", 0, 5000)
+field("Gravity", "Weapons", "Gravity scale", 0, "Multiplier of workspace gravity.", 0, 3)
+field("Interval", "Weapons", "Fire interval", 0.18, "Minimum time between automatic requests in seconds.", 0.04, 2)
+field("WeaponRange", "Weapons", "Weapon range", 450, "Maximum effective range in studs.", 10, 1500)
+field("WeaponBody", "Weapons", "Weapon aim point", "Profile", "Override the default aim point.", {"Profile", "Closest", "Head", "Torso", "Root"})
+field("WeaponLead", "Weapons", "Weapon lead scale", 1, "Multiply profile prediction for this weapon.", 0, 2)
+field("WeaponFov", "Weapons", "Weapon FOV override", 0, "Override the profile radius in pixels. Zero uses the profile value.", 0, 1600)
+
+local function valueFor(entry, value)
+    if type(value) ~= type(entry.default) then return entry.default end
+    if type(entry.min) == "table" then return table.find(entry.min, value) and value or entry.default end
+    if type(value) == "number" then
+        return finite(value) and math.clamp(value, entry.min, entry.max) or entry.default
+    end
+    if entry.key == "Color" then return value:match("^#%x%x%x%x%x%x$") and value:upper() or entry.default end
+    if entry.key == "CombatKey" or entry.key == "MenuKey" then
+        for _, key in ipairs(Enum.KeyCode:GetEnumItems()) do
+            if key.Name == value and key ~= Enum.KeyCode.Unknown then return value end
+        end
+        return entry.default
+    end
+    return value
+end
+
+local function normalize(source, weaponsOnly)
+    source = type(source) == "table" and source or {}
+    local result = {}
+    for _, entry in ipairs(fields) do
+        if (entry.page == "Weapons") == weaponsOnly then
+            result[entry.key] = valueFor(entry, source[entry.key])
+        end
+    end
+    if not weaponsOnly then
+        result.Weapons = {}
+        local count = 0
+        if type(source.Weapons) == "table" then
+            for key, value in pairs(source.Weapons) do
+                if cleanName(key) == key and type(value) == "table" and count < 32 then
+                    result.Weapons[key] = normalize(value, true)
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return result
+end
+
+local activeName = "Default"
+local profiles = {
+    Default = normalize(nil, false),
+    Precision = normalize({Mode = "Legit", Smooth = 8, LegitFov = 72}, false),
+    Arena = normalize({Mode = "Rage", Priority = "Threat", Counter = "Adaptive"}, false),
+}
+local config = copy(profiles.Default)
+local defaultWeapon = normalize(nil, true)
+local editingWeapon = "Default"
+local revision, savedRevision, due = 0, 0, math.huge
+local profileDirty = false
+local saving = false
+local alive = true
+local profileRemote = Storage:FindFirstChild("AkiraProfiles")
+if profileRemote and not profileRemote:IsA("RemoteFunction") then profileRemote = nil end
+local function decode(payload)
+    if type(payload) ~= "string" or #payload > 95000 then return nil end
+    local ok, data = pcall(JSON.JSONDecode, JSON, payload)
+    return ok and type(data) == "table" and data or nil
+end
+
+local function restore(payload)
+    local data = decode(payload)
+    if not data or data.version ~= 1 or type(data.profiles) ~= "table" then return end
+    local count = 3
+    for name, settings in pairs(data.profiles) do
+        if cleanName(name) == name and type(settings) == "table" and (profiles[name] or count < 12) then
+            if not profiles[name] then count = count + 1 end
+            profiles[name] = normalize(settings, false)
+        end
+    end
+    if type(data.active) == "string" and profiles[data.active] then activeName = data.active end
+    config = copy(profiles[activeName])
+end
+
+local cached = playerGui:GetAttribute("AkiraProfilesV1")
+restore(cached)
+config.Mode = "Off"
+local status
+local function message(value)
+    if status then status.Text = value end
+end
+
+local function changed(selectionOnly)
+    if not selectionOnly then profileDirty = true end
+    revision = revision + 1
+    due = os.clock() + 1
+end
+
+local function save(explicit)
+    if explicit then
+        revision = revision + 1
+        due = os.clock()
+    end
+    if saving or revision == savedRevision then return end
+    if explicit or profileDirty then
+        profiles[activeName] = copy(config)
+        profileDirty = false
+    end
+    local snapshot = revision
+    local payload = JSON:JSONEncode({version = 1, active = activeName, profiles = profiles})
+    if #payload > 95000 then
+        due = math.huge
+        message("Profile collection exceeds the storage limit")
+        return
+    end
+    playerGui:SetAttribute("AkiraProfilesV1", payload)
+    if not profileRemote then
+        savedRevision = snapshot
+        if explicit then message("Saved for this session") end
+        return
+    end
+    saving = true
+    task.spawn(function()
+        local ok, response = pcall(profileRemote.InvokeServer, profileRemote, "save", payload)
+        saving = false
+        if not alive then return end
+        if ok and response == true then
+            savedRevision = snapshot
+            if explicit then message("Profiles saved") end
+        else
+            due = os.clock() + 15
+            message("Server save failed · session copy retained")
+        end
+    end)
+end
+
+local opponents, tagged, observations = {}, {}, {}
+local function addTag(model)
+    if model:IsA("Model") then tagged[model] = true end
+end
+for _, instance in ipairs(Collection:GetTagged("AkiraOpponent")) do addTag(instance) end
+connect(Collection:GetInstanceAddedSignal("AkiraOpponent"), addTag)
+connect(Collection:GetInstanceRemovedSignal("AkiraOpponent"), function(model) tagged[model] = nil end)
+
+local accuracy = {shots = 0, hits = 0, damage = 0, received = 0}
+local target, targetSince, lastRequest, lastMove = nil, 0, -math.huge, 0
+local triggerTarget, triggerSince = nil, 0
+local function rootOf(model)
+    local root = model and model:FindFirstChild("HumanoidRootPart")
+    return root and root:IsA("BasePart") and root or nil
+end
+
+local function currentWeapon()
+    local char = player.Character
+    return (char and cleanName(char:GetAttribute("AkiraWeapon"))) or "Default"
+end
+
+local function weaponSettings()
+    return config.Weapons[currentWeapon()] or config.Weapons.Default or defaultWeapon
+end
+
+local function eligible(model, owner, character)
+    if model == character or not model:IsDescendantOf(workspace) then return false end
+    local match = character:GetAttribute("AkiraMatch")
+    if match ~= model:GetAttribute("AkiraMatch") then return false end
+    local team = character:GetAttribute("AkiraTeam")
+    if team ~= nil then return team ~= model:GetAttribute("AkiraTeam") end
+    return not owner or owner.Neutral or player.Neutral or owner.Team ~= player.Team
+end
+
+local function sample(model, owner, character, now)
+    if not eligible(model, owner, character) then return end
+    local root = rootOf(model)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then return end
+    local item = observations[model]
+    local velocity = root.AssemblyLinearVelocity
+    if not item then
+        item = {velocity = velocity, acceleration = Vector3.zero, evasion = 0, exposures = 0,
+            visible = false, lastExposure = 0, exposureMean = 0, damage = 0, lastDamage = 0}
+        observations[model] = item
+    end
+    if item.time then
+        local dt = now - item.time
+        if dt > 0 then
+            local accel = (velocity - item.velocity) / dt
+            if accel.Magnitude > 240 then accel = accel.Unit * 240 end
+            item.acceleration = item.acceleration:Lerp(accel, 1 - math.exp(-dt * 8))
+            local flat = Vector3.new(accel.X, 0, accel.Z)
+            item.evasion = item.evasion + (flat.Magnitude - item.evasion) * (1 - math.exp(-dt * 3))
+        end
+    end
+    item.model, item.owner, item.root, item.humanoid = model, owner, root, humanoid
+    item.velocity, item.time = velocity, now
+    table.insert(opponents, item)
+end
+
+local function updateOpponents(now)
+    table.clear(opponents)
+    local char = player.Character
+    if char then
+        for _, owner in ipairs(Players:GetPlayers()) do
+            if owner ~= player and owner.Character then sample(owner.Character, owner, char, now) end
+        end
+        for model in pairs(tagged) do
+            if not Players:GetPlayerFromCharacter(model) then sample(model, nil, char, now) end
+        end
+    end
+    for model, item in pairs(observations) do
+        if item.time ~= now then observations[model] = nil end
+    end
+end
+
+local function trackVisibility(item, visible, now)
+    if visible == item.visible then return end
+    item.visible = visible
+    if visible then
+        item.lastExposure = now
+    elseif item.lastExposure > 0 then
+        local duration = now - item.lastExposure
+        if duration >= 0.06 then
+            item.exposures = item.exposures + 1
+            item.exposureMean = item.exposures == 1 and duration or item.exposureMean * 0.7 + duration * 0.3
+        end
+    end
+end
+
+local function counterFor(item)
+    if config.Mode ~= "Rage" then return 1, 0, "Default" end
+    local mode = config.Counter
+    if mode == "Adaptive" then
+        if item.evasion >= config.CustomThreshold then
+            mode = "UE"
+        elseif item.exposures >= 2 and item.exposureMean < 0.55 then
+            mode = "Sleepy"
+        else
+            mode = "Default"
+        end
+    end
+    if mode == "UE" then return 0.55, 0.04, mode end
+    if mode == "Sleepy" then return 0.85, 0.13, mode end
+    if mode == "Custom" then return config.CustomLead, config.CustomDelay, mode end
+    return 1, 0.025, mode
+end
+
+local function intercept(relative, velocity, speed)
+    local a = velocity:Dot(velocity) - speed * speed
+    local b = 2 * relative:Dot(velocity)
+    local c = relative:Dot(relative)
+    if c < 0.0001 then return 0 end
+    if math.abs(a) < 0.0001 then
+        if b < 0 then return -c / b end
+        return nil
+    end
+    local discriminant = b * b - 4 * a * c
+    if discriminant < 0 then return nil end
+    local square = math.sqrt(discriminant)
+    local q = -0.5 * (b + (b >= 0 and square or -square))
+    local first, second = q / a, q ~= 0 and c / q or -1
+    if first > 0 and second > 0 then return math.min(first, second) end
+    if first > 0 then return first end
+    if second > 0 then return second end
+    return nil
+end
+
+local function predicted(item, position, origin, weapon, scale)
+    local rage = config.Mode == "Rage"
+    local lead = (rage and config.Lead or 1) * weapon.WeaponLead * scale
+    local velocity = item.velocity * lead
+    local latency = rage and config.Latency or 0
+    if weapon.Speed == 0 then return position + velocity * latency end
+    local time = intercept(position - origin + velocity * latency, velocity, weapon.Speed)
+    if not time or time > 3 then return nil end
+    local accel = rage and item.acceleration * config.Acceleration * lead or Vector3.zero
+    local gravity = Vector3.new(0, workspace.Gravity * weapon.Gravity, 0)
+    local aim
+    for pass = 1, 4 do
+        local travel = time + latency
+        aim = position + velocity * travel + accel * (0.5 * travel * travel) + gravity * (0.5 * time * time)
+        local result = (aim - origin).Magnitude / weapon.Speed
+        if result > 3 then return nil end
+        if math.abs(result - time) < 0.005 or pass == 4 then
+            if math.abs(result - time) <= 0.06 then return aim end
+            return nil
+        end
+        time = result
+    end
+    return aim
+end
+
+local function bodyPoints(item, setting, camera, center)
+    local head = item.model:FindFirstChild("Head")
+    local torso = item.model:FindFirstChild("UpperTorso") or item.model:FindFirstChild("Torso")
+    head = head and head:IsA("BasePart") and head or item.root
+    torso = torso and torso:IsA("BasePart") and torso or item.root
+    if setting == "Head" then return {head} end
+    if setting == "Torso" then return {torso} end
+    if setting == "Root" then return {item.root} end
+    local candidates = {head}
+    if torso ~= head then table.insert(candidates, torso) end
+    if item.root ~= head and item.root ~= torso then table.insert(candidates, item.root) end
+    table.sort(candidates, function(a, b)
+        local av = camera:WorldToViewportPoint(a.Position)
+        local bv = camera:WorldToViewportPoint(b.Position)
+        return (Vector2.new(av.X, av.Y) - center).Magnitude < (Vector2.new(bv.X, bv.Y) - center).Magnitude
+    end)
+    return candidates
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+local function clearPath(origin, position, model)
+    local direction = position - origin
+    if direction.Magnitude < 0.01 then return true end
+    local hit = workspace:Raycast(origin, direction, rayParams)
+    return not hit or hit.Instance:IsDescendantOf(model)
+end
+
+local function radiusFor(weapon)
+    if weapon.WeaponFov > 0 then return weapon.WeaponFov end
+    return config.Mode == "Rage" and config.RageFov or config.LegitFov
+end
+
+local function pathClear(origin, point, item, weapon)
+    if weapon.Speed == 0 or weapon.Gravity == 0 then
+        return clearPath(origin, point, item.model)
+    end
+    local offset = point - origin
+    local flight = offset.Magnitude / weapon.Speed
+    local drop = Vector3.new(0, workspace.Gravity * weapon.Gravity * flight * flight * 0.5, 0)
+    local previousPoint = origin
+    for step = 1, 4 do
+        local alpha = step / 4
+        local nextPoint = origin + offset * alpha - drop * alpha * alpha
+        if not clearPath(previousPoint, nextPoint, item.model) then return false end
+        previousPoint = nextPoint
+    end
+    return true
+end
+
+local function acquire(camera, origin, weapon, now, tracking)
+    local center = camera.ViewportSize / 2
+    local radius = radiusFor(weapon)
+    local range = math.min(config.Range, weapon.WeaponRange)
+    local best, bestScore = nil, math.huge
+    local body = weapon.WeaponBody == "Profile" and config.Body or weapon.WeaponBody
+    local fullView = config.Mode == "Rage" and config.FullView
+    rayParams.FilterDescendantsInstances = player.Character and {player.Character, camera} or {camera}
+    for _, item in ipairs(opponents) do
+        local distance = (item.root.Position - origin).Magnitude
+        local visible, evaluated = false, false
+        if item.root.Parent and item.humanoid.Health > 0 and distance <= range
+            and item.model:GetAttribute("AkiraProtected") ~= true then
+            local lead, settle, counter = counterFor(item)
+            for _, part in ipairs(bodyPoints(item, body, camera, center)) do
+                local point = predicted(item, part.Position, origin, weapon, lead)
+                if point then
+                    local projected, inView = camera:WorldToViewportPoint(point)
+                    local offset = (Vector2.new(projected.X, projected.Y) - center).Magnitude
+                    if fullView or (inView and offset <= radius) then
+                        evaluated = true
+                        visible = pathClear(origin, point, item, weapon)
+                        if visible or not config.Visible then
+                            local screenScore = inView and offset / radius or 2 + distance / range
+                            local score = screenScore
+                            if config.Priority == "Distance" then score = distance / range + screenScore * 0.2 end
+                            if config.Priority == "Health" then
+                                score = item.humanoid.Health / math.max(1, item.humanoid.MaxHealth) + screenScore * 0.2
+                            end
+                            if config.Priority == "Threat" then
+                                local recent = item.damage * math.exp(-(now - item.lastDamage) / 6)
+                                score = distance / range + screenScore * 0.25 - math.min(1.5, recent / 100)
+                            end
+                            if target and item == target.item then score = score - config.Lock * 0.15 end
+                            if not visible then score = score + 0.4 end
+                            if score < bestScore then
+                                bestScore = score
+                                best = {item = item, part = part, point = point, visible = visible,
+                                    settle = settle, counter = counter, distance = distance}
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        if tracking then trackVisibility(item, evaluated and visible, now) end
+    end
+    return best
+end
+
+local held, toggled, touchAim = false, false, false
+local open = false
+local function armed()
+    if open or not allowed() or config.Mode == "Off" or Input:GetFocusedTextBox() then return false end
+    local char = player.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    return config.Activation == "Always" or touchAim
+        or (config.Activation == "Hold" and held) or (config.Activation == "Toggle" and toggled)
+end
+
+local random = Random.new()
+resolve.OnInvoke = function(origin, direction)
+    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return direction end
+    local length = direction.Magnitude
+    local camera = workspace.CurrentCamera
+    if not finite(origin.Magnitude) or not finite(length) or length < 0.0001 or not camera or not armed() then
+        return direction
+    end
+    if config.Mode == "Legit" and (not config.Silent or random:NextNumber(0, 100) >= config.Chance) then
+        return direction
+    end
+    local weapon = weaponSettings()
+    if not weapon.Enabled then return direction end
+    local solution = acquire(camera, origin, weapon, os.clock(), false)
+    local offset = solution and solution.point - origin
+    return offset and offset.Magnitude > 0.001 and offset.Unit * length or direction
+end
+
+connect(report.Event, function(kind, model, amount)
+    local item = typeof(model) == "Instance" and observations[model] or nil
+    local damage = finite(amount) and math.clamp(amount, 0, 10000) or 0
+    if kind == "Shot" then
+        accuracy.shots = accuracy.shots + 1
+    elseif kind == "Hit" then
+        accuracy.hits = accuracy.hits + 1
+        accuracy.damage = accuracy.damage + damage
+    elseif kind == "DamageTaken" then
+        accuracy.received = accuracy.received + damage
+        if item then
+            local now = os.clock()
+            item.damage = item.damage * math.exp(-(now - item.lastDamage) / 6) + damage
+            item.lastDamage = now
+        end
+    end
+end)
+
+local ink = Color3.fromRGB(233, 239, 250)
+local muted = Color3.fromRGB(155, 168, 185)
+local base = Color3.fromRGB(13, 19, 28)
+local panelColor = Color3.fromRGB(23, 32, 44)
+local control = Color3.fromRGB(35, 48, 64)
+local mint = Color3.fromRGB(114, 234, 209)
+local mobile = Input.TouchEnabled and not Input.KeyboardEnabled
+local function round(instance, radius)
+    new("UICorner", instance, {CornerRadius = UDim.new(0, radius or 9)})
+    return instance
+end
+local function textControl(class, parent, caption, properties)
+    local style = {
+        Text = caption, TextColor3 = ink, Font = Enum.Font.Gotham, TextSize = 14,
+        BackgroundTransparency = class == "TextLabel" and 1 or 0,
+        BackgroundColor3 = control, BorderSizePixel = 0,
+    }
+    for key, value in pairs(properties or {}) do style[key] = value end
+    return new(class, parent, style)
+end
+local function button(parent, caption, properties, callback)
+    local instance = round(textControl("TextButton", parent, caption, properties))
+    if callback then instance.Activated:Connect(callback) end
+    return instance
+end
+local function label(parent, caption, properties)
+    return textControl("TextLabel", parent, caption, properties)
+end
+local function box(parent, placeholder, properties)
+    local instance = round(textControl("TextBox", parent, "", properties))
+    instance.PlaceholderText = placeholder
+    instance.PlaceholderColor3 = muted
+    instance.ClearTextOnFocus = false
+    return instance
+end
+
+local hud = new("Frame", gui, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1})
+local overlay = new("Folder", gui, {Name = "Overlays"})
+local cross = new("Frame", hud, {
+    Size = UDim2.fromOffset(1, 1), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1,
+})
+local arms = {}
+for index = 1, 5 do
+    arms[index] = new("Frame", cross, {AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0})
+end
+local ring = new("Frame", cross, {AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1})
+new("UICorner", ring, {CornerRadius = UDim.new(0.5, 0)})
+local ringStroke = new("UIStroke", ring, {Thickness = 1, Transparency = 0.42})
+local targetHud = round(label(hud, "", {
+    AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 58),
+    Size = UDim2.new(0.91, 0, 0, 54), TextSize = mobile and 12 or 13,
+    TextWrapped = true, BackgroundTransparency = 0.14, BackgroundColor3 = base,
+}))
+new("UISizeConstraint", targetHud, {MaxSize = Vector2.new(590, 54)})
+
+local window = round(new("CanvasGroup", gui, {
+    BackgroundColor3 = base, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = mobile and UDim2.fromScale(0.92, 0.78) or UDim2.fromScale(0.91, 0.83),
+    GroupTransparency = 1, Visible = false,
+}))
+new("UISizeConstraint", window, {MaxSize = mobile and Vector2.new(540, 750) or Vector2.new(850, 675)})
+new("UIStroke", window, {Color = control, Thickness = 1})
+local heading = label(window, "Akira.gg", {
+    TextSize = 25, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+    Position = UDim2.fromOffset(16, 7), Size = UDim2.fromOffset(130, 41),
+})
+heading.TextColor3 = mint
+local search = box(window, mobile and "Search" or "Search all settings", {
+    Position = UDim2.new(0, 149, 0, 11), Size = UDim2.new(1, -199, 0, 34),
+})
+local transition
+local function setOpen(state)
+    open = state
+    touchAim, held, toggled = false, false, false
+    if transition then transition:Cancel() end
+    if state then window.Visible = true end
+    local animation = TweenService:Create(window, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        GroupTransparency = state and 0 or 1,
+    })
+    transition = animation
+    animation.Completed:Once(function()
+        if transition == animation and not open then window.Visible = false end
+    end)
+    animation:Play()
+end
+button(window, "×", {
+    Position = UDim2.new(1, -45, 0, 8), Size = UDim2.fromOffset(37, 39), TextSize = 23,
+}, function() setOpen(false) end)
+
+local pages = {"Combat", "Legit", "Rage", "Helper", "Visuals", "Weapons", "Profiles", "Misc"}
+local tabs = new("ScrollingFrame", window, {
+    Position = UDim2.fromOffset(10, 55),
+    Size = mobile and UDim2.new(1, -20, 0, 46) or UDim2.new(0, 124, 1, -104),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+    ScrollingDirection = mobile and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y,
+    AutomaticCanvasSize = mobile and Enum.AutomaticSize.X or Enum.AutomaticSize.Y,
+    CanvasSize = UDim2.fromOffset(0, 0),
+})
+new("UIListLayout", tabs, {
+    FillDirection = mobile and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+    Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder,
+})
+local rows = new("ScrollingFrame", window, {
+    Position = mobile and UDim2.fromOffset(10, 107) or UDim2.fromOffset(143, 55),
+    Size = mobile and UDim2.new(1, -20, 1, -151) or UDim2.new(1, -153, 1, -99),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, ScrollBarImageColor3 = muted,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.fromOffset(0, 0),
+})
+new("UIListLayout", rows, {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})
+status = label(window, profileRemote and "Server profile storage available" or "Session profiles · export JSON to keep a copy", {
+    Position = UDim2.new(0, 14, 1, -37), Size = UDim2.new(1, -28, 0, 28),
+    TextColor3 = muted, TextSize = 12, TextTruncate = Enum.TextTruncate.AtEnd,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local launcher = button(gui, mobile and "AK" or "Akira.gg", {
+    AnchorPoint = Vector2.new(0, 0), Position = UDim2.new(0, 13, 0.25, 0),
+    Size = UDim2.fromOffset(mobile and 52 or 72, mobile and 52 or 34),
+    TextColor3 = mint, BackgroundColor3 = base,
+})
+if not mobile then connect(launcher.Activated, function() setOpen(not open) end) end
+local aimButton
+if mobile then
+    aimButton = button(gui, "Aim", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -22, 0.56, 0),
+        Size = UDim2.fromOffset(59, 53), BackgroundColor3 = base,
+    }, function()
+        touchAim = not touchAim
+    end)
+end
+
+local drag, dragOrigin, dragStart, dragged
+local slider, sliderInput
+if mobile then
+    connect(launcher.InputBegan, function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch or drag then return end
+        drag, dragOrigin, dragStart, dragged = input, input.Position, launcher.AbsolutePosition, false
+    end)
+end
+connect(Input.InputChanged, function(input)
+    if slider and (input == sliderInput or (sliderInput.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseMovement)) then
+        slider(input.Position.X)
+    end
+    if input == drag then
+        local delta = input.Position - dragOrigin
+        if delta.Magnitude > 9 then dragged = true end
+        if dragged then
+            local frame = hud.AbsoluteSize
+            launcher.Position = UDim2.fromOffset(
+                math.clamp(dragStart.X + delta.X, 0, math.max(0, frame.X - launcher.AbsoluteSize.X)),
+                math.clamp(dragStart.Y + delta.Y, 0, math.max(0, frame.Y - launcher.AbsoluteSize.Y))
+            )
+        end
+    end
+end)
+connect(Input.InputEnded, function(input)
+    if input == sliderInput then slider, sliderInput = nil, nil end
+    if input == drag then
+        drag = nil
+        if not dragged then setOpen(not open) end
+    end
+    if input.KeyCode.Name == config.CombatKey then held = false end
+end)
+connect(Input.WindowFocusReleased, function()
+    held, toggled, touchAim, drag, slider, sliderInput = false, false, false, nil, nil, nil
+end)
+connect(Input.InputBegan, function(input, processed)
+    if processed or Input:GetFocusedTextBox() then return end
+    if input.KeyCode.Name == config.MenuKey then
+        setOpen(not open)
+    elseif not open and input.KeyCode.Name == config.CombatKey then
+        held = true
+        if config.Activation == "Toggle" then toggled = not toggled end
+    end
+end)
+
+local selected, tabButtons = "Combat", {}
+local rebuild
+local function section(caption)
+    return label(rows, caption, {
+        Size = UDim2.new(1, -8, 0, 27), TextColor3 = mint, TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = #rows:GetChildren(),
+    })
+end
+local function row(entry, height)
+    local card = round(new("Frame", rows, {
+        Size = UDim2.new(1, -8, 0, height or (mobile and 95 or 58)), BackgroundColor3 = panelColor,
+        LayoutOrder = #rows:GetChildren(),
+    }))
+    label(card, entry.label, {
+        Position = UDim2.fromOffset(10, 6), Size = UDim2.new(mobile and 1 or 0.54, -15, 0, 19),
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    label(card, entry.help or "", {
+        Position = UDim2.fromOffset(10, 25), Size = UDim2.new(mobile and 1 or 0.54, -15, 0, mobile and 24 or 29),
+        TextColor3 = muted, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    })
+    local area = new("Frame", card, {
+        Size = mobile and UDim2.new(1, -20, 0, 39) or UDim2.new(0.43, -7, 0, 34),
+        Position = mobile and UDim2.fromOffset(10, 50) or UDim2.new(0.57, 0, 0, 12),
+        BackgroundTransparency = 1,
+    })
+    return card, area
+end
+
+local full = {Size = UDim2.fromScale(1, 1)}
+local function setting(entry)
+    local card, area = row(entry)
+    local weapon = entry.page == "Weapons"
+    local key = entry.key
+    local function get()
+        local set = weapon and (config.Weapons[editingWeapon] or config.Weapons.Default or defaultWeapon) or config
+        return set[key]
+    end
+    local function set(value)
+        local settings = config
+        if weapon then
+            if not config.Weapons[editingWeapon] then
+                local count = 0
+                for _ in pairs(config.Weapons) do count = count + 1 end
+                if count >= 32 then message("This profile has 32 weapon configurations") return end
+                config.Weapons[editingWeapon] = copy(config.Weapons.Default or defaultWeapon)
+                changed()
+            end
+            settings = config.Weapons[editingWeapon]
+        end
+        local normalized = valueFor(entry, value)
+        if settings[key] ~= normalized then
+            settings[key] = normalized
+            changed()
+        end
+    end
+    if type(entry.min) == "table" or key == "Color" then
+        local choices = entry.min or {"#72EAD1", "#F59BA7", "#F4D580", "#94B8FF", "#FFFFFF", "#C7A4FA"}
+        local expanded = false
+        local pop
+        local dropdown = button(area, get() .. "  ▾", full, function()
+            expanded = not expanded
+            if pop then pop:Destroy() pop = nil end
+            local initial = mobile and 95 or 58
+            card.Size = UDim2.new(1, -8, 0, expanded and initial + #choices * 34 or initial)
+            if not expanded then return end
+            pop = new("Frame", card, {
+                Size = UDim2.new(1, -20, 0, #choices * 34), Position = UDim2.fromOffset(10, initial),
+                BackgroundTransparency = 1,
+            })
+            for index, option in ipairs(choices) do
+                local tint = key == "Color" and Color3.fromHex(option:sub(2)) or ink
+                button(pop, option, {
+                    TextColor3 = tint, Size = UDim2.new(1, 0, 0, 30),
+                    Position = UDim2.fromOffset(0, (index - 1) * 34),
+                }, function() set(option) rebuild(true) end)
+            end
+        end)
+        if key == "Color" then
+            dropdown.Size = UDim2.fromScale(0.47, 1)
+            local hex = box(area, "#RRGGBB", {Position = UDim2.fromScale(0.50, 0), Size = UDim2.fromScale(0.5, 1)})
+            hex.Text = get()
+            hex.FocusLost:Connect(function()
+                if hex.Text:match("^#%x%x%x%x%x%x$") then set(hex.Text) rebuild(true)
+                else hex.Text = get() end
+            end)
+        end
+    elseif type(entry.default) == "boolean" then
+        local toggle = button(area, "", full)
+        local function refresh()
+            toggle.Text = get() and "On" or "Off"
+            toggle.TextColor3 = get() and mint or muted
+        end
+        toggle.Activated:Connect(function() set(not get()) refresh() end)
+        refresh()
+    elseif type(entry.default) == "number" then
+        local track = round(new("Frame", area, {
+            Size = UDim2.new(0.70, 0, 1, 0), BackgroundColor3 = control, Active = true,
+        }))
+        local fill = round(new("Frame", track, {BackgroundColor3 = mint, BackgroundTransparency = 0.54, BorderSizePixel = 0}))
+        local number = box(area, "", {Position = UDim2.fromScale(0.73, 0), Size = UDim2.fromScale(0.27, 1)})
+        local function refresh()
+            local value = get()
+            number.Text = string.format("%.3g", value)
+            fill.Size = UDim2.fromScale((value - entry.min) / (entry.max - entry.min), 1)
+        end
+        track.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            sliderInput = input
+            slider = function(x)
+                local alpha = math.clamp((x - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+                local value = entry.min + (entry.max - entry.min) * alpha
+                local step = entry.max <= 5 and 100 or 1
+                set(math.floor(value * step + 0.5) / step)
+                refresh()
+            end
+            slider(input.Position.X)
+        end)
+        number.FocusLost:Connect(function()
+            local value = tonumber(number.Text)
+            if finite(value) then set(value) end
+            refresh()
+        end)
+        refresh()
+    else
+        local settingBox = box(area, entry.default, full)
+        settingBox.Text = get()
+        settingBox.FocusLost:Connect(function()
+            set(settingBox.Text)
+            settingBox.Text = get()
+        end)
+    end
+    if not mobile then
+        card.MouseEnter:Connect(function() message(entry.help) end)
+    end
+end
+
+local transfer = ""
+local profileInput = ""
+local function profileRow(title, help, actions)
+    local _, area = row({label = title, help = help})
+    for i, action in ipairs(actions) do
+        local fraction = 1 / #actions
+        button(area, action[1], {
+            Position = UDim2.fromScale((i - 1) * fraction, 0),
+            Size = UDim2.new(fraction, -3, 1, 0), TextSize = 12,
+        }, action[2])
+    end
+end
+
+local function selectProfile(name, discard)
+    if not discard and profileDirty and config.AutoSave then profiles[activeName] = copy(config) end
+    profileDirty = false
+    activeName = name
+    config = copy(profiles[name])
+    held, toggled, touchAim = false, false, false
+    target, triggerTarget = nil, nil
+    changed(true)
+    rebuild(true)
+    message("Loaded " .. name)
+end
+
+local function profilesUI()
+    section("Profiles")
+    local _, area = row({label = "Profile name", help = "Use 1–32 letters, digits, spaces, dots, dashes or underscores."})
+    local name = box(area, "New profile name", full)
+    name.Text = profileInput
+    name:GetPropertyChangedSignal("Text"):Connect(function() profileInput = name.Text end)
+    profileRow("Profile actions", "Create a copy of current settings, or save the selected profile.", {
+        {"Create", function()
+            local key = cleanName(profileInput)
+            if not key then message("Enter a valid profile name") return end
+            if profiles[key] then message("That profile already exists") return end
+            local count = 0
+            for _ in pairs(profiles) do count = count + 1 end
+            if count >= 12 then message("Profile limit reached") return end
+            profiles[key] = copy(config)
+            selectProfile(key)
+            save(true)
+        end},
+        {"Save", function() save(true) end},
+        {"Delete", function()
+            if activeName == "Default" or activeName == "Precision" or activeName == "Arena" then
+                message("Built-in presets cannot be deleted")
+                return
+            end
+            profiles[activeName] = nil
+            selectProfile("Default", true)
+            save(true)
+        end},
+    })
+    local names = {}
+    for key in pairs(profiles) do table.insert(names, key) end
+    table.sort(names)
+    for _, key in ipairs(names) do
+        profileRow(key, key == activeName and "Current profile" or "Saved profile", {
+            {"Load", function() selectProfile(key) end},
+        })
+    end
+    section("Import and export")
+    local payload = box(rows, "Paste a profile JSON payload", {
+        Size = UDim2.new(1, -8, 0, 125), LayoutOrder = #rows:GetChildren(),
+        MultiLine = true, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, TextSize = 12,
+    })
+    payload.Text = transfer
+    payload:GetPropertyChangedSignal("Text"):Connect(function() transfer = payload.Text end)
+    profileRow("Profile JSON", "Export to the text field, or import into the current profile.", {
+        {"Export", function()
+            payload.Text = JSON:JSONEncode({version = 1, settings = config})
+            payload:CaptureFocus()
+            payload.CursorPosition = #payload.Text + 1
+            payload.SelectionStart = 1
+            message("Profile JSON selected")
+        end},
+        {"Import", function()
+            local data = decode(transfer)
+            if not data or data.version ~= 1 or type(data.settings) ~= "table" then
+                message("Invalid Akira profile JSON") return
+            end
+            config = normalize(data.settings, false)
+            config.Mode = "Off"
+            held, toggled, touchAim = false, false, false
+            changed()
+            rebuild(true)
+            message("Imported into " .. activeName .. " · combat off")
+        end},
+    })
+end
+
+rebuild = function(preserveScroll)
+    slider, sliderInput = nil, nil
+    local scroll = rows.CanvasPosition
+    for _, child in ipairs(rows:GetChildren()) do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    for page, tab in pairs(tabButtons) do
+        tab.BackgroundColor3 = page == selected and control or panelColor
+        tab.TextColor3 = page == selected and mint or muted
+    end
+    local query = search.Text:lower():match("^%s*(.-)%s*$")
+    if selected == "Profiles" and query == "" then
+        profilesUI()
+    else
+        local matches = 0
+        if selected == "Weapons" or query ~= "" then
+            local _, area = row({label = "Edit weapon", help = "Enter the AkiraWeapon ID. Default applies when no override exists."})
+            local name = box(area, "Weapon ID", {Size = UDim2.fromScale(0.67, 1)})
+            name.Text = editingWeapon
+            name.FocusLost:Connect(function()
+                local key = cleanName(name.Text)
+                if key and key ~= editingWeapon then editingWeapon = key rebuild(true)
+                else name.Text = editingWeapon end
+            end)
+            button(area, "Held", {Position = UDim2.fromScale(0.70, 0), Size = UDim2.fromScale(0.3, 1)}, function()
+                editingWeapon = currentWeapon()
+                rebuild(true)
+            end)
+        end
+        for _, entry in ipairs(fields) do
+            local searchable = (entry.page .. " " .. entry.label .. " " .. entry.help):lower()
+            if (query == "" and entry.page == selected) or (query ~= "" and searchable:find(query, 1, true)) then
+                setting(entry)
+                matches = matches + 1
+            end
+        end
+        if query ~= "" and matches == 0 then section("No matching settings") end
+        if selected == "Weapons" and query == "" and config.Weapons[editingWeapon] then
+            profileRow("Reset weapon", "Remove this override from the current profile.", {{"Reset", function()
+                config.Weapons[editingWeapon] = nil
+                changed()
+                rebuild(true)
+            end}})
+        end
+    end
+    rows.CanvasPosition = preserveScroll and scroll or Vector2.zero
+end
+for index, page in ipairs(pages) do
+    tabButtons[page] = button(tabs, page, {
+        LayoutOrder = index, Size = mobile and UDim2.fromOffset(82, 39) or UDim2.new(1, -5, 0, 38),
+    }, function()
+        local alreadyClear = search.Text == ""
+        selected = page
+        if alreadyClear then rebuild(false) else search.Text = "" end
+    end)
+end
+connect(search:GetPropertyChangedSignal("Text"), function() rebuild(false) end)
+rebuild(false)
+setOpen(true)
+if profileRemote then
+    local startingRevision = revision
+    task.spawn(function()
+        local ok, payload = pcall(profileRemote.InvokeServer, profileRemote, "load")
+        if not alive or startingRevision ~= revision then return end
+        if not ok then
+            message("Server profile load failed")
+            return
+        end
+        if type(payload) == "string" then
+            restore(payload)
+            config.Mode = "Off"
+            rebuild(false)
+        end
+    end)
+end
+
+local markers = {}
+local function clearMarkers()
+    for model, marker in pairs(markers) do
+        marker.tag:Destroy()
+        marker.highlight:Destroy()
+        markers[model] = nil
+    end
+end
+
+local function color()
+    return Color3.fromHex(config.Color:sub(2))
+end
+
+local function updateVisuals(camera, tint)
+    if aimButton then
+        aimButton.Visible = not open and allowed() and config.Mode ~= "Off" and config.Activation ~= "Always"
+        aimButton.Text = touchAim and "Aim on" or "Aim"
+        aimButton.TextColor3 = touchAim and mint or ink
+    end
+    local running = allowed()
+    local length, gap = config.Length, config.Gap
+    local offset = gap + length / 2
+    for index, arm in ipairs(arms) do
+        arm.Visible = running and (index == 5 and config.Crosshair == "Dot" or index <= 4 and config.Crosshair == "Lines")
+        arm.BackgroundColor3 = tint
+    end
+    arms[1].Position, arms[1].Size = UDim2.fromOffset(-offset, 0), UDim2.fromOffset(length, 2)
+    arms[2].Position, arms[2].Size = UDim2.fromOffset(offset, 0), UDim2.fromOffset(length, 2)
+    arms[3].Position, arms[3].Size = UDim2.fromOffset(0, -offset), UDim2.fromOffset(2, length)
+    arms[4].Position, arms[4].Size = UDim2.fromOffset(0, offset), UDim2.fromOffset(2, length)
+    arms[5].Size = UDim2.fromOffset(4, 4)
+    local diameter = radiusFor(weaponSettings()) * 2
+    ring.Size = UDim2.fromOffset(diameter, diameter)
+    ring.Visible = running and config.Fov and config.Mode ~= "Off" and not (config.Mode == "Rage" and config.FullView)
+    ringStroke.Color = tint
+    targetHud.Visible = running and config.Stats and not open
+    if targetHud.Visible then
+        local rate = accuracy.shots > 0 and string.format("%.0f%%", 100 * accuracy.hits / accuracy.shots) or "—"
+        local first = string.format("%s · %s · %s landed · %.0f dealt · %.0f taken",
+            config.Mode, armed() and "armed" or "standby", rate, accuracy.damage, accuracy.received)
+        if target then
+            local item = target.item
+            targetHud.Text = first .. string.format("\n%s · %.0f studs · %s · evasion %.0f · peek %.2fs",
+                item.owner and item.owner.DisplayName or item.model.Name, target.distance,
+                target.counter, item.evasion, item.exposureMean)
+        else
+            targetHud.Text = first
+        end
+    end
+    if not running or open or not camera or not (config.Overlay or config.Boxes) then
+        clearMarkers()
+        return
+    end
+    for _, item in ipairs(opponents) do
+        local model, root = item.model, item.root
+        if not markers[model] then
+            local tag = new("BillboardGui", overlay, {
+                Size = UDim2.fromOffset(190, 34), StudsOffsetWorldSpace = Vector3.new(0, 3.4, 0), MaxDistance = 1500,
+                AlwaysOnTop = false, LightInfluence = 0,
+            })
+            local tagText = label(tag, "", {Size = UDim2.fromScale(1, 1), TextStrokeTransparency = 0.3, TextSize = 12})
+            local highlight = new("Highlight", overlay, {
+                Adornee = model, FillTransparency = 0.8, OutlineTransparency = 0.22, DepthMode = Enum.HighlightDepthMode.Occluded,
+            })
+            markers[model] = {tag = tag, text = tagText, highlight = highlight}
+        end
+        local marker = markers[model]
+        local distance = (camera.CFrame.Position - root.Position).Magnitude
+        marker.tag.Adornee = root
+        marker.tag.MaxDistance = config.Range
+        marker.tag.Enabled = config.Overlay
+        marker.text.TextColor3 = tint
+        local name = item.owner and item.owner.DisplayName or model.Name
+        local lines = {}
+        if config.Names then table.insert(lines, name) end
+        if config.Health then table.insert(lines, string.format("%d HP", math.ceil(item.humanoid.Health))) end
+        if config.Gear then
+            local gear = model:GetAttribute("AkiraWeapon")
+            if type(gear) == "string" then table.insert(lines, gear:sub(1, 32)) end
+            local ammo = model:GetAttribute("AkiraAmmo")
+            if finite(ammo) then table.insert(lines, string.format("%.0f ammo", ammo)) end
+        end
+        table.insert(lines, string.format("%d studs", math.floor(distance + 0.5)))
+        marker.text.Text = table.concat(lines, " · ")
+        marker.highlight.Enabled = config.Boxes and distance <= config.Range
+        marker.highlight.FillColor, marker.highlight.OutlineColor = tint, tint
+    end
+    for model, marker in pairs(markers) do
+        if not observations[model] then
+            marker.tag:Destroy()
+            marker.highlight:Destroy()
+            markers[model] = nil
+        end
+    end
+end
+
+local function suggest(now, camera, solution)
+    if config.Movement == "Off" or now - lastMove < 0.15 then return end
+    local selfRoot = rootOf(player.Character)
+    if not selfRoot then return end
+    local action = config.Movement
+    if action == "Adaptive" then
+        if solution.distance < 12 then action = "Disengage"
+        elseif solution.counter == "Sleepy" then action = "Peek"
+        elseif solution.counter == "UE" then action = "Hold"
+        else action = "Orbit" end
+    end
+    local position = selfRoot.Position
+    local targetPosition = solution.item.root.Position
+    if action == "Orbit" then
+        local theta = now * config.OrbitSpeed
+        position = Vector3.new(targetPosition.X, position.Y, targetPosition.Z)
+            + Vector3.new(math.cos(theta), 0, math.sin(theta)) * config.OrbitRadius
+    elseif action == "Disengage" then
+        local away = position - targetPosition
+        away = Vector3.new(away.X, 0, away.Z)
+        if away.Magnitude > 0.01 then position = position + away.Unit * config.OrbitRadius end
+    elseif action == "Peek" then
+        local side = camera.CFrame.RightVector
+        position = position + Vector3.new(side.X, 0, side.Z) * math.min(8, config.OrbitRadius)
+    end
+    lastMove = now
+    strategy:Fire(action, solution.item.model, position)
+end
+
+local triggerParams = RaycastParams.new()
+triggerParams.FilterType = Enum.RaycastFilterType.Exclude
+triggerParams.IgnoreWater = true
+local function requestFire(now, camera, weapon, solution)
+    local char = player.Character
+    local ammo = char:GetAttribute("AkiraAmmo")
+    if char:GetAttribute("AkiraReloading") == true or (finite(ammo) and ammo <= 0) then return end
+    local origin = camera.CFrame.Position
+    local direction
+    local kind
+    if config.Mode == "Rage" and config.AutoFire and solution and now - targetSince >= solution.settle then
+        direction = solution.point - origin
+        kind = "Rage"
+    elseif config.Mode == "Legit" and config.Trigger then
+        triggerParams.FilterDescendantsInstances = {char, camera}
+        local range = math.min(config.Range, weapon.WeaponRange)
+        local ray = workspace:Raycast(origin, camera.CFrame.LookVector * range, triggerParams)
+        local hit
+        if ray then
+            for _, item in ipairs(opponents) do
+                if ray.Instance:IsDescendantOf(item.model) and item.model:GetAttribute("AkiraProtected") ~= true then
+                    hit = item
+                    break
+                end
+            end
+        end
+        if hit ~= triggerTarget then triggerTarget, triggerSince = hit, now end
+        if hit and now - triggerSince >= config.TriggerDelay and now - lastRequest >= weapon.Interval then
+            lastRequest = now
+            fire:Fire("Trigger", camera.CFrame.LookVector, hit.model)
+        end
+        return
+    end
+    if direction and direction.Magnitude > 0.01 and now - lastRequest >= weapon.Interval then
+        lastRequest = now
+        fire:Fire(kind, direction.Unit, solution.item.model, solution.point)
+    end
+end
+
+local fovCamera, originalFov, appliedFov
+local function restoreFov()
+    if fovCamera and fovCamera.FieldOfView == appliedFov then fovCamera.FieldOfView = originalFov end
+    fovCamera, originalFov, appliedFov = nil, nil, nil
+end
+
+local renderName = "Akira.gg.Camera." .. JSON:GenerateGUID(false)
+RunService:BindToRenderStep(renderName, Enum.RenderPriority.Camera.Value + 1, function(dt)
+    if not alive then return end
+    local camera = workspace.CurrentCamera
+    local desired = allowed() and config.CameraFov >= 1 and math.clamp(config.CameraFov, 1, 110)
+    if not desired or camera ~= fovCamera then restoreFov() end
+    if camera and desired then
+        if not fovCamera then fovCamera, originalFov = camera, camera.FieldOfView end
+        appliedFov = desired
+        if camera.FieldOfView ~= desired then camera.FieldOfView = desired end
+    end
+    if not camera or open or not armed() or not target then return end
+    if (config.Mode == "Rage" and not config.Steer) or (config.Mode == "Legit" and config.Silent) then return end
+    local from = camera.CFrame.Position
+    if (target.point - from).Magnitude > 0.01 then
+        local alpha = config.Mode == "Rage" and 1 or 1 - math.exp(-config.Smooth * dt)
+        camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(from, target.point), alpha)
+    end
+end)
+
+local tickAt, visualAt = 0, 0
+local lastWeaponKey, lastMode
+connect(RunService.Heartbeat, function()
+    if not alive then return end
+    local now = os.clock()
+    if now >= due and revision ~= savedRevision and config.AutoSave then save(false) end
+    if now < tickAt then return end
+    tickAt = now + 1 / 24
+    local camera = workspace.CurrentCamera
+    if allowed() then
+        updateOpponents(now)
+    else
+        table.clear(opponents)
+        table.clear(observations)
+    end
+    local weaponKey = currentWeapon()
+    if weaponKey ~= lastWeaponKey or config.Mode ~= lastMode then
+        lastWeaponKey, lastMode = weaponKey, config.Mode
+        target, triggerTarget = nil, nil
+    end
+    local weapon = weaponSettings()
+    if camera and not open and armed() and weapon.Enabled then
+        local solution = acquire(camera, camera.CFrame.Position, weapon, now, true)
+        if not target or not solution or solution.item ~= target.item or solution.visible ~= target.visible then
+            targetSince = now
+        end
+        target = solution
+        requestFire(now, camera, weapon, solution)
+        if config.Mode == "Rage" and solution then suggest(now, camera, solution) end
+    else
+        target, triggerTarget, targetSince = nil, nil, now
+    end
+    if now >= visualAt then
+        visualAt = now + 0.1
+        updateVisuals(camera, color())
+    end
+end)
+
+local function shutdown()
+    if not alive then return end
+    alive = false
+    RunService:UnbindFromRenderStep(renderName)
+    restoreFov()
+    if config.AutoSave then save(false) end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    clearMarkers()
+end
+connect(stop.Event, shutdown)
+connect(gui.Destroying, shutdown)
+connect(script.Destroying, function()
+    shutdown()
+    gui:Destroy()
+end)
+
+if type(getgenv) == "function" then
+    local ok, environment = pcall(getgenv)
+    if ok and type(environment) == "table" then
+        local handle = {
+            Open = function()
+                if alive and allowed() then setOpen(true) end
+            end,
+            Close = function()
+                if alive then setOpen(false) end
+            end,
+            Unload = function()
+                if not alive then return end
+                shutdown()
+                gui:Destroy()
+            end,
+        }
+        environment.AkiraGG = handle
+        gui.Destroying:Once(function()
+            if environment.AkiraGG == handle then environment.AkiraGG = nil end
+        end)
+    end
+end
